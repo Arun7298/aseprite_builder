@@ -1,99 +1,64 @@
-name: Build and deploy Aseprite
+name: Build Aseprite (manual latest)
 
 on:
   workflow_dispatch:
-  # Optional: keep schedule/push if you want, but you said "when I run it"
-  # schedule:
-  #   - cron: '0 0 * * *'
-  # push:
-  #   branches:
-  #     - master
 
 env:
   BUILD_TYPE: Release
 
 jobs:
-  check-version:
-    name: Check latest Aseprite release
+  get-latest:
+    name: Get latest Aseprite tag
     runs-on: ubuntu-latest
     outputs:
-      download_url: ${{ steps.version_info.outputs.download_url }}
-      latest_tag: ${{ steps.version_info.outputs.latest_tag }}
-      version_info: ${{ steps.version_info.outputs.version_info }}
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-
+      latest_tag: ${{ steps.latest.outputs.latest_tag }}
+      version_info: ${{ steps.latest.outputs.version_info }}
     steps:
-      - name: Get latest version info
-        id: version_info
+      - name: Fetch latest release metadata
+        id: latest
         shell: bash
         run: |
           set -euo pipefail
           data=$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)
           LATEST_TAG=$(echo "${data}" | jq -r '.tag_name')
-
-          # Prefer a source zip; otherwise first zip; otherwise first asset.
-          DOWNLOAD_URL=$(echo "${data}" | jq -r '
-            ( .assets[]?.browser_download_url
-              | select(test("source|src"; "i"))
-              | select(endswith(".zip"))
-            ) // empty
-          ' | head -n 1)
-
-          if [ -z "${DOWNLOAD_URL}" ]; then
-            DOWNLOAD_URL=$(echo "${data}" | jq -r '
-              ( .assets[]?.browser_download_url | select(endswith(".zip")) ) // empty
-            ' | head -n 1)
-          fi
-
-          if [ -z "${DOWNLOAD_URL}" ]; then
-            DOWNLOAD_URL=$(echo "${data}" | jq -r '.assets[]?.browser_download_url' | head -n 1)
-          fi
-
           VERSION_INFO=$(echo "${data}" | jq -r '.body // ""')
 
           {
             echo "latest_tag=${LATEST_TAG}"
-            echo "download_url=${DOWNLOAD_URL}"
             echo "version_info<<EOF"
             echo "${VERSION_INFO}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create Release (draft)
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.version_info.outputs.latest_tag }}
-          release_name: Release Aseprite ${{ steps.version_info.outputs.latest_tag }}
-          body: |
-            ${{ steps.version_info.outputs.version_info }}
-          draft: true
-          prerelease: false
-
-  build-aseprite:
+  build-windows:
     name: Build Aseprite (Windows)
-    needs: check-version
+    needs: get-latest
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Ninja + 7zip
+      - name: Install build tools (ninja, 7zip, git)
         shell: pwsh
         run: |
-          choco install -y ninja 7zip
+          choco install -y ninja 7zip git
 
-      - name: Get Skia from cache
+      # ✅ Official MSBuild environment (no deprecated set-env/add-path)
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # Optional but helpful: ensures cl.exe environment exists
+      - name: Setup Visual Studio Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache Skia
         id: skia-cache
         uses: actions/cache@v4
         with:
           path: skia
           key: skia-windows-m81-b607b32047
 
-      - name: Download Skia if not in cache
+      - name: Download Skia (if cache miss)
         if: steps.skia-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
@@ -102,51 +67,67 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/aseprite/skia/releases/download/m81-b607b32047/Skia-Windows-Release-X64.zip" -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath "skia"
 
-      - name: Download Aseprite source zip
+      - name: Checkout Aseprite source at latest tag
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $url = "${{ needs.check-version.outputs.download_url }}"
-          if ([string]::IsNullOrWhiteSpace($url)) { throw "DOWNLOAD_URL is empty. The release may not have a zip asset." }
+          $tag = "${{ needs.get-latest.outputs.latest_tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) { throw "Latest tag is empty" }
 
-          Invoke-WebRequest -Uri $url -OutFile "Aseprite-source.zip"
-          Expand-Archive -Path "Aseprite-source.zip" -DestinationPath "aseprite"
+          git clone --depth 1 --branch $tag https://github.com/aseprite/aseprite.git aseprite
+
           New-Item -ItemType Directory -Force -Path "aseprite/build" | Out-Null
 
-      - name: Setup VS Dev Env
-        uses: seanmiddleditch/gha-setup-vsdevenv@v1
-
-      - name: Run CMake (Ninja)
+      - name: Configure (CMake + Ninja)
         working-directory: aseprite/build
-        shell: cmd
-        run: cmake -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DCMAKE_IGNORE_PATH="C:/ProgramData/chocolatey/bin/;C:/Strawberry/c/bin/" -DLAF_BACKEND=skia -DSKIA_DIR=../../skia -DSKIA_LIBRARY_DIR=../../skia/out/Release-x64 -G Ninja ..
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            -G "Ninja" `
+            -DCMAKE_BUILD_TYPE="${{ env.BUILD_TYPE }}" `
+            -DLAF_BACKEND=skia `
+            -DSKIA_DIR="../../skia" `
+            -DSKIA_LIBRARY_DIR="../../skia/out/Release-x64" `
+            ..
 
       - name: Build (Ninja)
         working-directory: aseprite/build
-        shell: cmd
-        run: ninja aseprite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          ninja aseprite
 
-      - name: Clean up build extras
+      - name: Make portable + clean extras
         working-directory: aseprite/build/bin
-        shell: bash
-        run: rm -f gen modp_b64_gen gen.exe gen.exe.manifest modp_b64_gen.exe modp_b64_gen.exe.manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Content -Path "aseprite.ini" -Value "# This file is here so Aseprite behaves as a portable program"
 
-      - name: Make portable
+          # Remove helper binaries if present (harmless if missing)
+          $toRemove = @(
+            "gen","modp_b64_gen",
+            "gen.exe","gen.exe.manifest",
+            "modp_b64_gen.exe","modp_b64_gen.exe.manifest"
+          )
+          foreach ($f in $toRemove) {
+            if (Test-Path $f) { Remove-Item $f -Force }
+          }
+
+      - name: Zip build output
         working-directory: aseprite/build/bin
-        shell: bash
-        run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ needs.get-latest.outputs.latest_tag }}"
+          $zipName = "Aseprite-$tag-windows.zip"
+          & 7z a -tzip $zipName * | Out-Null
 
-      - name: Create release zip
-        working-directory: aseprite/build/bin
-        shell: cmd
-        run: 7z -tzip a "Aseprite-${{ needs.check-version.outputs.latest_tag }}-${{ runner.os }}.zip" *
-
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # ✅ Always gives you a downloadable artifact from the Actions run
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.check-version.outputs.upload_url }}
-          asset_path: aseprite/build/bin/Aseprite-${{ needs.check-version.outputs.latest_tag }}-${{ runner.os }}.zip
-          asset_name: Aseprite-${{ needs.check-version.outputs.latest_tag }}-${{ runner.os }}.zip
-          asset_content_type: application/zip
+          name: Aseprite-${{ needs.get-latest.outputs.latest_tag }}-windows
+          path: aseprite/build/bin/Aseprite-${{ needs.get-latest.outputs.latest_tag }}-windows.zip
