@@ -30,7 +30,7 @@ jobs:
           data=$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)
           LATEST_TAG=$(echo "${data}" | jq -r '.tag_name')
 
-          # Some releases have multiple assets; pick the source zip if available, otherwise first zip, otherwise first asset.
+          # Try to pick a "source" zip first; fall back to first .zip; then any asset
           DOWNLOAD_URL=$(echo "${data}" | jq -r '
             ( .assets[]?.browser_download_url | select(test("source|src"; "i")) | select(endswith(".zip")) ) // empty
           ' | head -n 1)
@@ -92,63 +92,54 @@ jobs:
     name: Build Aseprite
     needs: check-version
     if: ${{ needs.check-version.outputs.should_build == 'true' }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [windows-latest]
-      fail-fast: false
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: (Windows) Install dependencies
-        if: matrix.os == 'windows-latest'
-        uses: seanmiddleditch/gha-setup-ninja@v1
-
-      - name: (Ubuntu) Install dependencies
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt install -y cmake ninja-build libxcursor-dev libxi-dev libgl1-mesa-dev
-
-      - name: (macOS) Install dependencies
-        if: matrix.os == 'macOS-latest'
-        run: brew install ninja p7zip
+      # ✅ FIX: Don't use gha-setup-ninja (it uses add-path). Install ninja via choco.
+      - name: Install Ninja + 7zip
+        shell: pwsh
+        run: |
+          choco install -y ninja 7zip
 
       - name: Get Skia from cache
         id: skia-cache
         uses: actions/cache@v4
         with:
           path: skia
-          key: skia-${{ matrix.os }}-cache
+          key: skia-windows-cache
 
       - name: Download Skia if not in cache
         if: steps.skia-cache.outputs.cache-hit != 'true'
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          curl -o Skia-${{ runner.os }}-Release-X64.zip -L https://github.com/aseprite/skia/releases/download/m81-b607b32047/Skia-${{ runner.os }}-Release-X64.zip
-          unzip -q Skia-${{ runner.os }}-Release-X64.zip -d skia
+          $ErrorActionPreference = "Stop"
+          $zip = "Skia-Windows-Release-X64.zip"
+          Invoke-WebRequest -Uri "https://github.com/aseprite/skia/releases/download/m81-b607b32047/Skia-Windows-Release-X64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "skia"
 
       - name: Download Aseprite release
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          curl -o Aseprite-source.zip -L "${{ needs.check-version.outputs.download_url }}"
-          unzip -q Aseprite-source.zip -d aseprite
-          mkdir -p aseprite/build
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest -Uri "${{ needs.check-version.outputs.download_url }}" -OutFile "Aseprite-source.zip"
+          Expand-Archive -Path "Aseprite-source.zip" -DestinationPath "aseprite"
+          New-Item -ItemType Directory -Force -Path "aseprite/build" | Out-Null
 
-      - name: (Windows) Setting Visual Studio build environment variables and paths
-        if: matrix.os == 'windows-latest'
+      # Keep your VS environment setup
+      - name: Setup VS Dev Env
         uses: seanmiddleditch/gha-setup-vsdevenv@v1
 
-      - name: (Windows) Run CMake
-        if: matrix.os == 'windows-latest'
+      - name: Run CMake (Ninja)
         working-directory: aseprite/build
         shell: cmd
         run: cmake -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DCMAKE_IGNORE_PATH="C:/ProgramData/chocolatey/bin/;C:/Strawberry/c/bin/" -DLAF_BACKEND=skia -DSKIA_DIR=../../skia -DSKIA_LIBRARY_DIR=../../skia/out/Release-x64 -G Ninja ..
 
       - name: Run Ninja
         working-directory: aseprite/build
+        shell: cmd
         run: ninja aseprite
 
       - name: Clean up build
@@ -156,14 +147,14 @@ jobs:
         shell: bash
         run: rm -f gen modp_b64_gen gen.exe gen.exe.manifest modp_b64_gen.exe modp_b64_gen.exe.manifest
 
-      - name: (Windows) Make portable zip
+      - name: Make portable
         working-directory: aseprite/build/bin
         shell: bash
         run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
 
       - name: Create release zip
         working-directory: aseprite/build/bin
-        shell: bash
+        shell: cmd
         run: 7z -tzip a "Aseprite-${{ needs.check-version.outputs.latest_tag }}-${{ runner.os }}.zip" *
 
       - name: Upload release asset
