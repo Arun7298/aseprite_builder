@@ -12,7 +12,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       latest_tag: ${{ steps.latest.outputs.latest_tag }}
-      version_info: ${{ steps.latest.outputs.version_info }}
     steps:
       - name: Fetch latest release metadata
         id: latest
@@ -21,14 +20,7 @@ jobs:
           set -euo pipefail
           data=$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)
           LATEST_TAG=$(echo "${data}" | jq -r '.tag_name')
-          VERSION_INFO=$(echo "${data}" | jq -r '.body // ""')
-
-          {
-            echo "latest_tag=${LATEST_TAG}"
-            echo "version_info<<EOF"
-            echo "${VERSION_INFO}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
 
   build-windows:
     name: Build Aseprite (Windows)
@@ -36,10 +28,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Install build tools (ninja, 7zip, git)
+      - name: Install tools (git, ninja, 7zip)
         shell: pwsh
         run: |
-          choco install -y ninja 7zip git
+          choco install -y git ninja 7zip
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -56,16 +48,66 @@ jobs:
           path: skia
           key: skia-windows-m81-b607b32047
 
-      - name: Download Skia (if cache miss)
+      - name: Download + extract Skia (if cache miss)
         if: steps.skia-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $zip = "Skia-Windows-Release-X64.zip"
           Invoke-WebRequest -Uri "https://github.com/aseprite/skia/releases/download/m81-b607b32047/Skia-Windows-Release-X64.zip" -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath "skia"
 
-      # ✅ FIX: clone with submodules
+          # Extract to a temp folder first so we can normalize layout
+          if (Test-Path "skia_tmp") { Remove-Item "skia_tmp" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "skia_tmp" | Out-Null
+          Expand-Archive -Path $zip -DestinationPath "skia_tmp" -Force
+
+          # Create final skia folder
+          if (Test-Path "skia") { Remove-Item "skia" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "skia" | Out-Null
+
+          # Find the real root in the extracted content (handles nested folder zips)
+          $candidates = @("skia_tmp") + (Get-ChildItem "skia_tmp" -Directory | ForEach-Object { $_.FullName })
+          $root = $null
+          foreach ($c in $candidates) {
+            if (Test-Path (Join-Path $c "third_party") -or Test-Path (Join-Path $c "out")) {
+              $root = $c
+              break
+            }
+          }
+          if (-not $root) {
+            # fallback: maybe one more nesting
+            $nested = Get-ChildItem "skia_tmp" -Recurse -Directory | Where-Object {
+              (Test-Path (Join-Path $_.FullName "third_party")) -or (Test-Path (Join-Path $_.FullName "out"))
+            } | Select-Object -First 1
+            if ($nested) { $root = $nested.FullName }
+          }
+          if (-not $root) { throw "Could not find Skia root after extraction." }
+
+          # Move contents of the discovered root into ./skia
+          Get-ChildItem $root -Force | ForEach-Object {
+            Move-Item $_.FullName -Destination "skia" -Force
+          }
+
+          Remove-Item "skia_tmp" -Recurse -Force
+
+      - name: Set SKIA_DIR env (absolute) + validate Skia
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $skiaRoot = (Resolve-Path "skia").Path
+
+          # Hard checks for expected structure
+          if (-not (Test-Path (Join-Path $skiaRoot "third_party"))) { throw "Skia missing third_party at $skiaRoot" }
+          if (-not (Test-Path (Join-Path $skiaRoot "out\Release-x64"))) { throw "Skia missing out\\Release-x64 at $skiaRoot" }
+
+          # This file was missing in your error; verify it's actually present now.
+          $icu = Join-Path $skiaRoot "third_party\externals\icu\flutter\icudtl.dat"
+          if (-not (Test-Path $icu)) { throw "Skia ICU data file missing: $icu (Skia package/version mismatch or bad extraction)" }
+
+          "SKIA_DIR=$skiaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SKIA_LIBRARY_DIR=$skiaRoot\out\Release-x64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Clone Aseprite + submodules at latest tag
         shell: pwsh
         run: |
@@ -74,8 +116,6 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($tag)) { throw "Latest tag is empty" }
 
           git clone --recursive --depth 1 --branch $tag https://github.com/aseprite/aseprite.git aseprite
-
-          # Safety: ensure submodules are initialized even if git behaves differently on Windows
           cd aseprite
           git submodule update --init --recursive
           cd ..
@@ -92,8 +132,8 @@ jobs:
             -G "Ninja" `
             -DCMAKE_BUILD_TYPE="${{ env.BUILD_TYPE }}" `
             -DLAF_BACKEND=skia `
-            -DSKIA_DIR="../../skia" `
-            -DSKIA_LIBRARY_DIR="../../skia/out/Release-x64" `
+            -DSKIA_DIR="${{ env.SKIA_DIR }}" `
+            -DSKIA_LIBRARY_DIR="${{ env.SKIA_LIBRARY_DIR }}" `
             ..
 
       - name: Build (Ninja)
