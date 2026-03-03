@@ -2,11 +2,12 @@ name: Build and deploy Aseprite
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *'
-  push:
-    branches:
-      - master
+  # Optional: keep schedule/push if you want, but you said "when I run it"
+  # schedule:
+  #   - cron: '0 0 * * *'
+  # push:
+  #   branches:
+  #     - master
 
 env:
   BUILD_TYPE: Release
@@ -18,7 +19,7 @@ jobs:
     outputs:
       download_url: ${{ steps.version_info.outputs.download_url }}
       latest_tag: ${{ steps.version_info.outputs.latest_tag }}
-      should_build: ${{ steps.should_build.outputs.should_build }}
+      version_info: ${{ steps.version_info.outputs.version_info }}
       upload_url: ${{ steps.create_release.outputs.upload_url }}
 
     steps:
@@ -30,9 +31,12 @@ jobs:
           data=$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)
           LATEST_TAG=$(echo "${data}" | jq -r '.tag_name')
 
-          # Try to pick a "source" zip first; fall back to first .zip; then any asset
+          # Prefer a source zip; otherwise first zip; otherwise first asset.
           DOWNLOAD_URL=$(echo "${data}" | jq -r '
-            ( .assets[]?.browser_download_url | select(test("source|src"; "i")) | select(endswith(".zip")) ) // empty
+            ( .assets[]?.browser_download_url
+              | select(test("source|src"; "i"))
+              | select(endswith(".zip"))
+            ) // empty
           ' | head -n 1)
 
           if [ -z "${DOWNLOAD_URL}" ]; then
@@ -47,8 +51,6 @@ jobs:
 
           VERSION_INFO=$(echo "${data}" | jq -r '.body // ""')
 
-          echo "${LATEST_TAG}" > "${LATEST_TAG}.txt"
-
           {
             echo "latest_tag=${LATEST_TAG}"
             echo "download_url=${DOWNLOAD_URL}"
@@ -57,26 +59,8 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Load version from cache
-        id: version_check
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.version_info.outputs.latest_tag }}.txt
-          key: cached_version
-
-      - name: Should we start new build?
-        id: should_build
-        shell: bash
-        run: |
-          if [ "${{ steps.version_check.outputs.cache-hit }}" != "true" ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create Release
+      - name: Create Release (draft)
         id: create_release
-        if: steps.should_build.outputs.should_build == 'true'
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -89,16 +73,14 @@ jobs:
           prerelease: false
 
   build-aseprite:
-    name: Build Aseprite
+    name: Build Aseprite (Windows)
     needs: check-version
-    if: ${{ needs.check-version.outputs.should_build == 'true' }}
     runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ✅ FIX: Don't use gha-setup-ninja (it uses add-path). Install ninja via choco.
       - name: Install Ninja + 7zip
         shell: pwsh
         run: |
@@ -109,7 +91,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: skia
-          key: skia-windows-cache
+          key: skia-windows-m81-b607b32047
 
       - name: Download Skia if not in cache
         if: steps.skia-cache.outputs.cache-hit != 'true'
@@ -120,15 +102,17 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/aseprite/skia/releases/download/m81-b607b32047/Skia-Windows-Release-X64.zip" -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath "skia"
 
-      - name: Download Aseprite release
+      - name: Download Aseprite source zip
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Invoke-WebRequest -Uri "${{ needs.check-version.outputs.download_url }}" -OutFile "Aseprite-source.zip"
+          $url = "${{ needs.check-version.outputs.download_url }}"
+          if ([string]::IsNullOrWhiteSpace($url)) { throw "DOWNLOAD_URL is empty. The release may not have a zip asset." }
+
+          Invoke-WebRequest -Uri $url -OutFile "Aseprite-source.zip"
           Expand-Archive -Path "Aseprite-source.zip" -DestinationPath "aseprite"
           New-Item -ItemType Directory -Force -Path "aseprite/build" | Out-Null
 
-      # Keep your VS environment setup
       - name: Setup VS Dev Env
         uses: seanmiddleditch/gha-setup-vsdevenv@v1
 
@@ -137,12 +121,12 @@ jobs:
         shell: cmd
         run: cmake -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DCMAKE_IGNORE_PATH="C:/ProgramData/chocolatey/bin/;C:/Strawberry/c/bin/" -DLAF_BACKEND=skia -DSKIA_DIR=../../skia -DSKIA_LIBRARY_DIR=../../skia/out/Release-x64 -G Ninja ..
 
-      - name: Run Ninja
+      - name: Build (Ninja)
         working-directory: aseprite/build
         shell: cmd
         run: ninja aseprite
 
-      - name: Clean up build
+      - name: Clean up build extras
         working-directory: aseprite/build/bin
         shell: bash
         run: rm -f gen modp_b64_gen gen.exe gen.exe.manifest modp_b64_gen.exe modp_b64_gen.exe.manifest
