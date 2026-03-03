@@ -41,12 +41,10 @@ jobs:
         run: |
           choco install -y ninja 7zip git
 
-      # ✅ Official MSBuild environment (no deprecated set-env/add-path)
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      # Optional but helpful: ensures cl.exe environment exists
-      - name: Setup Visual Studio Developer Command Prompt
+      - name: Setup MSVC Dev Cmd (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -67,14 +65,20 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/aseprite/skia/releases/download/m81-b607b32047/Skia-Windows-Release-X64.zip" -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath "skia"
 
-      - name: Checkout Aseprite source at latest tag
+      # ✅ FIX: clone with submodules
+      - name: Clone Aseprite + submodules at latest tag
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $tag = "${{ needs.get-latest.outputs.latest_tag }}"
           if ([string]::IsNullOrWhiteSpace($tag)) { throw "Latest tag is empty" }
 
-          git clone --depth 1 --branch $tag https://github.com/aseprite/aseprite.git aseprite
+          git clone --recursive --depth 1 --branch $tag https://github.com/aseprite/aseprite.git aseprite
+
+          # Safety: ensure submodules are initialized even if git behaves differently on Windows
+          cd aseprite
+          git submodule update --init --recursive
+          cd ..
 
           New-Item -ItemType Directory -Force -Path "aseprite/build" | Out-Null
 
@@ -106,7 +110,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           Set-Content -Path "aseprite.ini" -Value "# This file is here so Aseprite behaves as a portable program"
 
-          # Remove helper binaries if present (harmless if missing)
           $toRemove = @(
             "gen","modp_b64_gen",
             "gen.exe","gen.exe.manifest",
@@ -125,7 +128,6 @@ jobs:
           $zipName = "Aseprite-$tag-windows.zip"
           & 7z a -tzip $zipName * | Out-Null
 
-      # ✅ Always gives you a downloadable artifact from the Actions run
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
