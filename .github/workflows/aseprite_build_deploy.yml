@@ -14,41 +14,67 @@ jobs:
       latest_tag: ${{ steps.meta.outputs.latest_tag }}
       skia_tag: ${{ steps.meta.outputs.skia_tag }}
     steps:
-      - name: Fetch latest release metadata + detect Skia tag
+      - name: Fetch latest release tag
+        id: rel
+        shell: bash
+        run: |
+          set -euo pipefail
+          data=$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)
+          LATEST_TAG=$(echo "${data}" | jq -r '.tag_name')
+          echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Detect Skia tag from Aseprite repo workflows
         id: meta
         shell: bash
         run: |
           set -euo pipefail
+          LATEST_TAG="${{ steps.rel.outputs.latest_tag }}"
 
-          data=$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)
-          LATEST_TAG=$(echo "${data}" | jq -r '.tag_name')
-
-          # Try a few known docs files that often contain the Skia download URL
-          files=(
-            "INSTALL.md"
-            "docs/INSTALL.md"
-            "README.md"
-            "docs/build.md"
-            "BUILDING.md"
+          # 1) Try the most likely workflow filenames first
+          candidates=(
+            "https://raw.githubusercontent.com/aseprite/aseprite/${LATEST_TAG}/.github/workflows/build.yml"
+            "https://raw.githubusercontent.com/aseprite/aseprite/${LATEST_TAG}/.github/workflows/build.yaml"
+            "https://raw.githubusercontent.com/aseprite/aseprite/${LATEST_TAG}/.github/workflows/ci.yml"
+            "https://raw.githubusercontent.com/aseprite/aseprite/${LATEST_TAG}/.github/workflows/ci.yaml"
+            "https://raw.githubusercontent.com/aseprite/aseprite/${LATEST_TAG}/.github/workflows/aseprite.yml"
+            "https://raw.githubusercontent.com/aseprite/aseprite/${LATEST_TAG}/.github/workflows/aseprite.yaml"
           )
 
           skia_tag=""
-          for f in "${files[@]}"; do
-            url="https://raw.githubusercontent.com/aseprite/aseprite/${LATEST_TAG}/${f}"
-            txt=$(curl -fsSL "$url" || true)
-            if [ -n "${txt}" ]; then
-              # Extract the part after /download/ up to the next slash
-              skia_tag=$(echo "${txt}" | grep -oE 'github\.com/aseprite/skia/releases/download/[^/"]+' | head -n 1 | sed -E 's#.*download/##')
-              if [ -n "${skia_tag}" ]; then
-                echo "Found Skia tag '${skia_tag}' in ${f}"
+
+          for u in "${candidates[@]}"; do
+            txt=$(curl -fsSL "$u" || true)
+            if [ -n "$txt" ]; then
+              skia_tag=$(echo "$txt" | grep -oE 'aseprite/skia/releases/download/[^/"]+' | head -n 1 | sed -E 's#.*download/##')
+              if [ -n "$skia_tag" ]; then
+                echo "Found skia tag in $u: $skia_tag"
                 break
               fi
             fi
           done
 
-          if [ -z "${skia_tag}" ]; then
-            echo "Could not detect Skia tag from docs at ${LATEST_TAG}."
-            echo "This usually means the docs changed format. Failing so you can see this clearly."
+          # 2) If still not found, list workflow directory via GitHub API and scan each workflow file
+          if [ -z "$skia_tag" ]; then
+            api="https://api.github.com/repos/aseprite/aseprite/contents/.github/workflows?ref=${LATEST_TAG}"
+            items=$(curl -fsSL "$api" | jq -r '.[]?.download_url' || true)
+
+            if [ -n "$items" ]; then
+              while IFS= read -r dl; do
+                [ -z "$dl" ] && continue
+                txt=$(curl -fsSL "$dl" || true)
+                if [ -n "$txt" ]; then
+                  skia_tag=$(echo "$txt" | grep -oE 'aseprite/skia/releases/download/[^/"]+' | head -n 1 | sed -E 's#.*download/##')
+                  if [ -n "$skia_tag" ]; then
+                    echo "Found skia tag in workflow $dl: $skia_tag"
+                    break
+                  fi
+                fi
+              done <<< "$items"
+            fi
+          fi
+
+          if [ -z "$skia_tag" ]; then
+            echo "Could not detect Skia tag for Aseprite ${LATEST_TAG} from workflows."
             exit 1
           fi
 
@@ -129,19 +155,11 @@ jobs:
 
           Remove-Item "skia_tmp" -Recurse -Force
 
-      - name: Set SKIA env (absolute) + validate Skia
+      - name: Set SKIA env (absolute)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $skiaRoot = (Resolve-Path "skia").Path
-
-          if (-not (Test-Path (Join-Path $skiaRoot "third_party"))) { throw "Skia missing third_party at $skiaRoot" }
-          if (-not (Test-Path (Join-Path $skiaRoot "out\Release-x64"))) { throw "Skia missing out\\Release-x64 at $skiaRoot" }
-
-          # Aseprite expects this file with prebuilt Skia packages
-          $icu = Join-Path $skiaRoot "third_party\externals\icu\flutter\icudtl.dat"
-          if (-not (Test-Path $icu)) { throw "Skia ICU data missing: $icu" }
-
           "SKIA_DIR=$skiaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "SKIA_LIBRARY_DIR=$skiaRoot\out\Release-x64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -150,13 +168,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $tag = "${{ needs.get-latest.outputs.latest_tag }}"
-          if ([string]::IsNullOrWhiteSpace($tag)) { throw "latest_tag is empty" }
-
           git clone --recursive --depth 1 --branch $tag https://github.com/aseprite/aseprite.git aseprite
           cd aseprite
           git submodule update --init --recursive
           cd ..
-
           New-Item -ItemType Directory -Force -Path "aseprite/build" | Out-Null
 
       - name: Configure (CMake + Ninja)
@@ -164,7 +179,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
           cmake `
             -G "Ninja" `
             -DCMAKE_BUILD_TYPE="${{ env.BUILD_TYPE }}" `
@@ -180,21 +194,12 @@ jobs:
           $ErrorActionPreference = "Stop"
           ninja aseprite
 
-      - name: Make portable + clean extras
+      - name: Make portable
         working-directory: aseprite/build/bin
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Set-Content -Path "aseprite.ini" -Value "# This file is here so Aseprite behaves as a portable program"
-
-          $toRemove = @(
-            "gen","modp_b64_gen",
-            "gen.exe","gen.exe.manifest",
-            "modp_b64_gen.exe","modp_b64_gen.exe.manifest"
-          )
-          foreach ($f in $toRemove) {
-            if (Test-Path $f) { Remove-Item $f -Force }
-          }
+          Set-Content -Path "aseprite.ini" -Value "# Portable mode"
 
       - name: Zip build output
         working-directory: aseprite/build/bin
