@@ -23,7 +23,6 @@ jobs:
           data=$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)
           LATEST_TAG=$(echo "${data}" | jq -r '.tag_name')
 
-          # Prefer the official *Source.zip* asset (includes required content/submodules)
           SOURCE_ZIP_URL=$(echo "${data}" | jq -r '
             .assets[]?.browser_download_url
             | select(test("Source\\.zip$"; "i"))
@@ -64,18 +63,16 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $url = "${{ needs.get-latest.outputs.source_zip_url }}"
-          $tag = "${{ needs.get-latest.outputs.latest_tag }}"
 
           Invoke-WebRequest -Uri $url -OutFile "Aseprite-Source.zip"
           Expand-Archive -Path "Aseprite-Source.zip" -DestinationPath "aseprite_src" -Force
 
-          # Source.zip usually extracts into a single folder; normalize to ./aseprite
+          # Normalize to ./aseprite
           if (Test-Path "aseprite") { Remove-Item "aseprite" -Recurse -Force }
           $dirs = Get-ChildItem "aseprite_src" -Directory
           if ($dirs.Count -eq 1) {
             Move-Item $dirs[0].FullName "aseprite"
           } else {
-            # fallback: if it extracted files directly
             New-Item -ItemType Directory -Force -Path "aseprite" | Out-Null
             Get-ChildItem "aseprite_src" -Force | ForEach-Object { Move-Item $_.FullName "aseprite" -Force }
           }
@@ -83,90 +80,109 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path "aseprite/build" | Out-Null
 
-      - name: Acquire compatible Skia (probe candidates)
+      - name: Detect required Skia tag from Aseprite source
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # We’ll try a handful of commonly-used Skia tags.
-          # If Aseprite changes, you only add one more line here.
-          $candidates = @(
-            "m81-b607b32047",
-            "m83-9a3b6d4f4a",
-            "m84-0c58b6a9a5",
-            "m85-7c0b3d0ed4",
-            "m86-8a8b5a1c27",
-            "m87-7b7a0d1c9f",
-            "m88-1f6e8d0a21",
-            "m89-3c2d1b0e7a",
-            "m90-4f1b0c2d3e",
-            "m91-5a1c2d3e4f",
-            "m92-6b2d3e4f5a",
-            "m93-7c3e4f5a6b",
-            "m94-8d4f5a6b7c",
-            "m95-9e5a6b7c8d"
-          )
+          # Search the extracted Aseprite source for a Skia download URL
+          $pattern = "aseprite/skia/releases/download/([^/]+)/Skia-"
+          $matches = Select-String -Path "aseprite\**\*" -Pattern $pattern -AllMatches -ErrorAction SilentlyContinue
 
-          function Extract-SkiaTo($tag) {
-            $zip = "Skia-Windows-Release-X64.zip"
-            $uri = "https://github.com/aseprite/skia/releases/download/$tag/$zip"
-            Write-Host "Trying Skia tag: $tag"
-            try {
-              Invoke-WebRequest -Uri $uri -OutFile $zip -TimeoutSec 60
-            } catch {
-              Write-Host "  download failed"
-              return $false
-            }
-
-            if (Test-Path "skia_tmp") { Remove-Item "skia_tmp" -Recurse -Force }
-            New-Item -ItemType Directory -Force -Path "skia_tmp" | Out-Null
-            Expand-Archive -Path $zip -DestinationPath "skia_tmp" -Force
-
-            if (Test-Path "skia") { Remove-Item "skia" -Recurse -Force }
-            New-Item -ItemType Directory -Force -Path "skia" | Out-Null
-
-            function IsSkiaRoot([string]$p) {
-              return (Test-Path (Join-Path $p "third_party")) -or (Test-Path (Join-Path $p "out"))
-            }
-
-            $root = $null
-            $cands = @((Resolve-Path "skia_tmp").Path) + (Get-ChildItem "skia_tmp" -Directory | ForEach-Object { $_.FullName })
-            foreach ($c in $cands) { if (IsSkiaRoot $c) { $root = $c; break } }
-            if (-not $root) {
-              $nested = Get-ChildItem "skia_tmp" -Recurse -Directory | Where-Object { IsSkiaRoot $_.FullName } | Select-Object -First 1
-              if ($nested) { $root = $nested.FullName }
-            }
-            if (-not $root) { return $false }
-
-            Get-ChildItem $root -Force | ForEach-Object { Move-Item $_.FullName -Destination "skia" -Force }
-            Remove-Item "skia_tmp" -Recurse -Force
-
-            $icu = "skia\third_party\externals\icu\flutter\icudtl.dat"
-            if (-not (Test-Path $icu)) {
-              Write-Host "  ICU file not found; not compatible."
-              return $false
-            }
-
-            "SKIA_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            return $true
+          if (-not $matches) {
+            throw "Could not find Skia download tag inside Aseprite source. The source format may have changed."
           }
 
-          $ok = $false
-          foreach ($t in $candidates) {
-            if (Extract-SkiaTo $t) { $ok = $true; break }
+          $tag = $null
+          foreach ($m in $matches) {
+            foreach ($am in $m.Matches) {
+              if ($am.Groups.Count -ge 2) {
+                $tag = $am.Groups[1].Value
+                break
+              }
+            }
+            if ($tag) { break }
           }
 
-          if (-not $ok) {
-            throw "Could not find a compatible Skia package from the candidate list. Add the correct Skia tag to the list."
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw "Found Skia URL pattern but failed to extract tag."
           }
 
-      - name: Set SKIA env (absolute)
+          "SKIA_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Detected SKIA_TAG=$tag"
+
+      - name: Cache Skia (versioned)
+        id: skia-cache
+        uses: actions/cache@v4
+        with:
+          path: skia
+          key: skia-windows-${{ env.SKIA_TAG }}
+
+      - name: Download + extract matching Skia (if cache miss)
+        if: steps.skia-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $skiaTag = "${{ env.SKIA_TAG }}"
+          if ([string]::IsNullOrWhiteSpace($skiaTag)) { throw "SKIA_TAG is empty" }
+
+          $zip = "Skia-Windows-Release-X64.zip"
+          $uri = "https://github.com/aseprite/skia/releases/download/$skiaTag/$zip"
+          Write-Host "Downloading Skia: $uri"
+          Invoke-WebRequest -Uri $uri -OutFile $zip
+
+          # Extract to temp first, then normalize into ./skia
+          if (Test-Path "skia_tmp") { Remove-Item "skia_tmp" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "skia_tmp" | Out-Null
+          Expand-Archive -Path $zip -DestinationPath "skia_tmp" -Force
+
+          if (Test-Path "skia") { Remove-Item "skia" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "skia" | Out-Null
+
+          function IsSkiaRoot([string]$p) {
+            return (Test-Path (Join-Path $p "third_party")) -or (Test-Path (Join-Path $p "out"))
+          }
+
+          $root = $null
+          $candidates = @((Resolve-Path "skia_tmp").Path) + (Get-ChildItem "skia_tmp" -Directory | ForEach-Object { $_.FullName })
+
+          foreach ($c in $candidates) {
+            if (IsSkiaRoot $c) { $root = $c; break }
+          }
+
+          if (-not $root) {
+            $nested = Get-ChildItem "skia_tmp" -Recurse -Directory | Where-Object { IsSkiaRoot $_.FullName } | Select-Object -First 1
+            if ($nested) { $root = $nested.FullName }
+          }
+
+          if (-not $root) { throw "Could not find Skia root after extraction." }
+
+          Get-ChildItem $root -Force | ForEach-Object {
+            Move-Item $_.FullName -Destination "skia" -Force
+          }
+
+          Remove-Item "skia_tmp" -Recurse -Force
+
+      - name: Set SKIA env (absolute) + validate
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $skiaRoot = (Resolve-Path "skia").Path
+
           "SKIA_DIR=$skiaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "SKIA_LIBRARY_DIR=$skiaRoot\out\Release-x64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          if (-not (Test-Path (Join-Path $skiaRoot "out\Release-x64"))) {
+            throw "Skia missing out\\Release-x64 at $skiaRoot"
+          }
+
+          # Accept either of these ICU layouts (Skia packages have varied over time)
+          $icu1 = Join-Path $skiaRoot "third_party\externals\icu\flutter\icudtl.dat"
+          $icu2 = Join-Path $skiaRoot "third_party\externals\icu\icudtl.dat"
+          if (-not (Test-Path $icu1) -and -not (Test-Path $icu2)) {
+            throw "Skia ICU data missing (checked: $icu1 and $icu2). Wrong Skia package/tag?"
+          }
 
       - name: Configure (CMake + Ninja)
         working-directory: aseprite/build
