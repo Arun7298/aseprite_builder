@@ -57,53 +57,52 @@ jobs:
           $zip = "Skia-Windows-Release-X64.zip"
           Invoke-WebRequest -Uri "https://github.com/aseprite/skia/releases/download/m81-b607b32047/Skia-Windows-Release-X64.zip" -OutFile $zip
 
-          # Extract to a temp folder first so we can normalize layout
+          # Extract to temp first
           if (Test-Path "skia_tmp") { Remove-Item "skia_tmp" -Recurse -Force }
           New-Item -ItemType Directory -Force -Path "skia_tmp" | Out-Null
           Expand-Archive -Path $zip -DestinationPath "skia_tmp" -Force
 
-          # Create final skia folder
+          # Recreate final skia folder
           if (Test-Path "skia") { Remove-Item "skia" -Recurse -Force }
           New-Item -ItemType Directory -Force -Path "skia" | Out-Null
 
-          # Find the real root in the extracted content (handles nested folder zips)
-          $candidates = @("skia_tmp") + (Get-ChildItem "skia_tmp" -Directory | ForEach-Object { $_.FullName })
-          $root = $null
-          foreach ($c in $candidates) {
-            if (Test-Path (Join-Path $c "third_party") -or Test-Path (Join-Path $c "out")) {
-              $root = $c
-              break
-            }
+          function IsSkiaRoot([string]$p) {
+            return (Test-Path (Join-Path $p "third_party")) -or (Test-Path (Join-Path $p "out"))
           }
+
+          # Find Skia root directory (handles nested zips)
+          $root = $null
+          $candidates = @((Resolve-Path "skia_tmp").Path) + (Get-ChildItem "skia_tmp" -Directory | ForEach-Object { $_.FullName })
+
+          foreach ($c in $candidates) {
+            if (IsSkiaRoot $c) { $root = $c; break }
+          }
+
           if (-not $root) {
-            # fallback: maybe one more nesting
-            $nested = Get-ChildItem "skia_tmp" -Recurse -Directory | Where-Object {
-              (Test-Path (Join-Path $_.FullName "third_party")) -or (Test-Path (Join-Path $_.FullName "out"))
-            } | Select-Object -First 1
+            $nested = Get-ChildItem "skia_tmp" -Recurse -Directory | Where-Object { IsSkiaRoot $_.FullName } | Select-Object -First 1
             if ($nested) { $root = $nested.FullName }
           }
+
           if (-not $root) { throw "Could not find Skia root after extraction." }
 
-          # Move contents of the discovered root into ./skia
+          # Move everything from the root into ./skia
           Get-ChildItem $root -Force | ForEach-Object {
             Move-Item $_.FullName -Destination "skia" -Force
           }
 
           Remove-Item "skia_tmp" -Recurse -Force
 
-      - name: Set SKIA_DIR env (absolute) + validate Skia
+      - name: Set SKIA env (absolute) + validate Skia
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $skiaRoot = (Resolve-Path "skia").Path
 
-          # Hard checks for expected structure
           if (-not (Test-Path (Join-Path $skiaRoot "third_party"))) { throw "Skia missing third_party at $skiaRoot" }
           if (-not (Test-Path (Join-Path $skiaRoot "out\Release-x64"))) { throw "Skia missing out\\Release-x64 at $skiaRoot" }
 
-          # This file was missing in your error; verify it's actually present now.
           $icu = Join-Path $skiaRoot "third_party\externals\icu\flutter\icudtl.dat"
-          if (-not (Test-Path $icu)) { throw "Skia ICU data file missing: $icu (Skia package/version mismatch or bad extraction)" }
+          if (-not (Test-Path $icu)) { throw "Skia ICU data missing: $icu (bad extraction or wrong Skia package)" }
 
           "SKIA_DIR=$skiaRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "SKIA_LIBRARY_DIR=$skiaRoot\out\Release-x64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
